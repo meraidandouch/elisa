@@ -1,0 +1,207 @@
+---
+title: "Analyzing Elisa :)"
+author: "merai dandouch"
+date: "2024-05-01"
+output:
+  html_document: default
+  pdf_document: default
+---
+#### HELLO! This file attemps to analyze an ELISA dataset that was retrieved from the gtools package in R.  
+
+## Setup
+
+R has different ways of keeping record of code/analysis such as RShiny or RMarkdown.
+This analysis project will be recorded using Rmarkdown. The analysis is split into code chunks which reference `main.R` and each *chunk* has a brief explanation of what it does .. just like this one! Calling the `source()` functions allows 
+me to grab code from a different file called `main.R`. The knitr package will neatly incorporate and format code into text and can be used to specify settings to apply to all code chunks or just a specific one. This file can be processed into different types of documents formats such as word, powerpoint, or webpages. For the sake of this example, I have 
+decided to report this code in HTML. 
+```{r Packages + setup, }
+source("main.R") # load all our wonderful functions
+knitr::opts_chunk$set(echo = TRUE, fig.height = 10) 
+```
+
+## Load the data using `load_data()` and store into a variable
+
+Original data was in .rda format and .rda files allows users to save R data structures such as 
+vectors, matrices, and data frames. Saving and loading data in rda format might be very useful 
+when working with large datasets that you want to clear from your memory, but you also 
+would like to save for later. In this example, I loaded the rda file using load() function and saved it as a csv file called `ELISA.csv`.
+
+Below, `ELISA.csv` is being sent to `load_data()` in the `main.R` file which will load the csv into a tibble and then merge PlateDay and Read columns into col called platedayNO. Looking at the first couple of rows in the dataset, duplicates are replicated row-wise...
+```{r Load data}
+datax <- load_data("ELISA.csv") 
+library(DT)
+datatable(datax)
+```
+
+## Pivot Columns  
+
+Because data is formatted row-wise, this makes it difficult to analyze and compute means for duplicates. This function converts the data so that it pivots wider and assigns each duplicate their own column such as Concentration_A and Concentration_B.
+
+```{r data_correction}
+gr_dup <- rep(1:(nrow(datax)/2), each = 2) #group technical replicates together  
+gr_AB <- rep(c('A', 'B'), len = nrow(datax)) #separate replicate sets called A and B
+colnames <- c('platedayNO', 'Description', 'Concentration','Signal') # col names to keep 
+datax <- data_wrangle(datax, gr_dup, gr_AB, colnames) 
+datax <- datax %>% 
+  rename(
+    concdil_A = Concentration_A,
+    concdil_B = Concentration_B)
+datax
+```
+
+## Find Mean Concentration 
+
+the header explains it all... 
+```{r find mean_concentration}
+datax <- datax %>%  
+    group_by(grp_dup) %>% 
+    mutate(mean_Signal = mean(c(Signal_A, Signal_B))) 
+datax
+```
+
+## Blank Correction 
+
+In order to account for background noise, and extract a true absorbency value, a blank correction has to be implemented. Below is a an embedded R code chunk doing just that. The dataset called datax is passed along to blank_correction() and the function will subtract the blank from the remaining signal values. 
+
+
+```{r blank_correction}
+datax <- blank_correction(datax) 
+datatable(datax)
+```
+
+
+## Simple Linear Regression Model to Find the Best Fitting Line
+
+To find the best fitting line for the standard set, a linear regression model is applied using 
+the lm() function in R to find the best fitting line and coefficients with minimal error. 
+The code block below is applying a linear_model(x,y) against the data where x is the predictor variable
+and y is the outcome variable. 
+
+Predictor Variable X = Theoretical Concentration 
+
+Outcome Variable Y = Mean Signal 
+
+The resulting table shows the coefficient and slope value for each plate. 
+
+```{r find best fitting line for each standard set}
+
+standards <- datax %>% 
+  filter(Description_A == 'Standard') %>%  
+  group_by(platedayNO_A)
+
+lin_mod <- standards %>% 
+  do(lin_coeff = coef(lm(mean_Signal ~ concdil_A, data = .))) %>% 
+  summarise(plateday_lm = platedayNO_A, b=lin_coeff[1], slope=lin_coeff[2])
+
+lin_mod
+
+```
+
+## Solving for the Concentration 
+
+After finding the coefficient and slope, we can now solve for the concentration and 
+because our coefficients were fit against a linear model, we can assume the line equation of y = mx + b.
+
+Using our values from above, and plugging it into the equation we can now add our concentration results.
+```{r solve_concentration}
+datax <- solve_for_x(datax, lin_mod) %>% 
+  mutate_if(is.double,  round, 3)
+datatable(datax)
+```
+
+## Calculate mean_Concentration and find coefficient of variation 
+
+Below is a an embedded R code chunk computing the mean concentration of groups A and B.  
+The dataset called datax is passed along to find_cv() and the function will 
+calculate the mean of two groups and then find std dev for the technical replicates
+and the variation from the mean, in other words, the coefficient variation.
+
+```{r find_cv}
+datax <- find_cv(datax)
+datax <- datax %>% mutate(across(where(is.numeric), round, 3))
+datax
+```
+## Standards Plot 
+
+Below is facet grid plotting standards for all plates in this dataset. 
+
+
+```{r standards, echo=FALSE}
+standards <- datax %>% filter(Description_A == 'Standard')
+ggplot(data=standards, aes(x=mean_Signal, y=mean_Concentration, group=1)) +
+  geom_line(linetype='dashed') + 
+  geom_point() + 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  facet_grid(rows = vars(platedayNO_A))
+
+```
+
+
+###  Caclulate LCL and UCL 
+
+Using shewhart charts (levey jenning) to determine if variables remain within the upper and lower control range. 
+
+If the mean concentration is the average variable for each subgroup (qc levels), then we can find the grand mean by adding all the qc level averages and dividing by the number of qc levels which is 7. 
+
+*Although this dataset does contain enough data points to pass CLT and assume normality. We cannot use pdc to determine std dev from the mean bc we don't know the population variance, so an estimated paramter is used instead *
+
+After getting the standard deviations for each subgroup, we can then calculate the average std dev for each of the subgroups by adding them and dividing by the total. The next challenge is to correct the std by using a theortical  factor (a~n~). Finally, the upper and lower control limits are retrieved for each QC level and are shown below in the table. 
+
+```{r calculate_LU_CL1}
+# IDK why im doing this 
+QC_all <- extract_qc(datax, 'Plate 1|Plate 2|Plate 3|Plate 4')
+# get the number of how many plates were ran (k=subgroups)
+N <- unique(QC_all$platedayNO_A) %>% length()
+# assign group for each QC levels (1 = 312.500, 2= 156.250, 3= 78.125,  4= 39.100 , 5= 19.500, 6=13.000, 7=9.750 ng/mL)
+QC_all$qc_lvl <- rep(1:(nrow(QC_all)/N), length = nrow(QC_all))
+CL <- calculate_LUCL(QC_all, N)
+CL
+QC_all <- QC_all %>% left_join(CL, by = c('qc_lvl') )
+
+```
+###  QC Plot 
+
+Below is a 7 figure plot for each QC level *(1 = 312.500, 2 = 156.250, 3 = 78.125,  4 = 39.100 , 5 = 19.500, 6 = 13.000, 7 = 9.750 ng/mL)* and the data points from each plate. It is shown that some QCS fall out of the upper and lower control limit range and should be omitted from the data and the LC and UC should be recomputed.
+
+```{r QC Plot1, echo=FALSE}
+ggplot(data=QC_all, aes(x=platedayNO_A, y=mean_Concentration, group=1)) +
+  geom_line() +
+  geom_hline(aes(yintercept=low), linetype="longdash", color="red") + 
+  geom_hline(aes(yintercept=grand_mean), linetype="longdash", color="darkgreen") + 
+  geom_hline(aes(yintercept=high), linetype="longdash", color="red") + 
+  geom_point() + 
+  facet_grid(rows = vars(qc_lvl), scales="free") + 
+  theme(axis.text.x = element_text(angle = 90)) 
+
+```
+
+###  Recalculate LCL and UCL after Filter 
+
+Before recalculating the LCL and UCL, the dataset should be filtered down to exclude any QCS higher or lower than the control range. After doing so, only 52 QC data points remain in the dataset.
+
+```{r calculate LU_CL2}
+QC_filter <- QC_all %>% filter(mean_Concentration >= low & mean_Concentration <= high)
+CL <- calculate_LUCL(QC_filter, N)
+QC_filter <- QC_filter %>% left_join(CL, by = c('qc_lvl') )
+QC_filter
+```
+
+
+
+### Recalculated QC Plot 
+
+Below is recalculated plot for the new LCL and UCL. Although the range is tighter for each QC level, there is not enough data points to qualify the QCs and future work should aim to collect more data and compute error probability such as false postives or false negatives. 
+
+```{r QC Plot, echo=FALSE}
+ggplot(data=QC_filter, aes(x=platedayNO_A, y=mean_Concentration, group=1)) +
+  geom_line() +
+  geom_hline(aes(yintercept=low.y), linetype="longdash", color="red") + 
+  geom_hline(aes(yintercept=grand_mean.y), linetype="longdash", color="darkgreen") + 
+  geom_hline(aes(yintercept=high.y), linetype="longdash", color="red") + 
+  geom_point() + 
+  facet_grid(rows = vars(qc_lvl), scales="free") + 
+  theme(axis.text.x = element_text(angle = 90)) 
+
+```
+
+Note that the `echo = TRUE` parameter was added to the code chunk to print the R code that generated the plot.
