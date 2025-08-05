@@ -1,7 +1,6 @@
 ---
 title: "Analyzing Elisa :)"
 author: "merai dandouch"
-date: "2024-05-01"
 output:
   html_document: default
   pdf_document: default
